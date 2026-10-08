@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+from core.permissions import ActionPermission, requires_permission
 import asyncio
 import concurrent.futures
 import os
@@ -923,6 +924,7 @@ class _SessionRegistry:
 
 _registry = _SessionRegistry()
 
+@requires_permission(ActionPermission.SIDE_EFFECTING)
 def browser_control(
     parameters:    dict = None,
     response=None,

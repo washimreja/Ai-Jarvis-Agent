@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import psutil
@@ -18,43 +19,21 @@ if platform.system() == "Windows":
 else:
     _WIN_HIDE: dict = {}
 
-# Qt's video backend prints the ffmpeg stream banner — codec, bitrate, the
-# whole signed googlevideo URL — to the console for every stream it opens. That
-# is two screenfuls per video, it looks like an error to anyone reading the log,
-# and it puts a URL carrying the viewer's IP address into a terminal people
-# paste into bug reports. Silenced here, before Qt initialises its logging.
-# An explicit setting from the user is left alone.
-os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
-
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
-    QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
-    QUrl, pyqtSignal,
+    QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
-# Video playback for the HUD. Part of PyQt6, so it costs no new dependency —
-# but the multimedia plugins are a separate piece of the Qt install and can be
-# absent on a stripped-down system, so a failure here disables one feature
-# rather than stopping JARVIS from starting.
-try:
-    from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
-    from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
-    HAVE_VIDEO = True
-except Exception as _e:            # noqa: BLE001 - reported, never fatal
-    QAudioOutput = QMediaPlayer = QGraphicsVideoItem = None
-    HAVE_VIDEO = False
-    print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
-
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QGraphicsScene, QGraphicsView,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
+from core.paths import CONFIG_DIR, CONFIG_FILE
 
 try:
     from core.avatar import HoloAvatar
@@ -67,9 +46,8 @@ def _base_dir() -> Path:
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
-BASE_DIR   = _base_dir()
-CONFIG_DIR = BASE_DIR / "config"
-API_FILE   = CONFIG_DIR / "api_keys.json"
+BASE_DIR = _base_dir()
+API_FILE = CONFIG_FILE
 
 
 def _read_full_config() -> dict:
@@ -82,7 +60,7 @@ def _read_full_config() -> dict:
 
 # Single source of truth for the release name — the window title, the header
 # badge and the readme must never disagree again.
-APP_VERSION  = "MARK LV"
+APP_VERSION  = "MARK LIV"
 APP_PROTOCOL = APP_VERSION.split()[-1]
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
@@ -1097,6 +1075,115 @@ class LogWidget(QTextEdit):
             self.setTextCursor(cur)
             self.ensureCursorVisible()
             QTimer.singleShot(20, self._next)
+
+
+class HistoryWidget(QWidget):
+    """Lazy-loading, expandable Neon chat history for the activity log."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loaded = False
+        self._busy = False
+        self._rows = QVBoxLayout()
+        self._rows.setContentsMargins(4, 4, 4, 4)
+        self._rows.setSpacing(5)
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._content = QWidget()
+        self._content.setLayout(self._rows)
+        self._scroll.setWidget(self._content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._scroll)
+        self._show_status("Select HISTORY to load saved messages.")
+
+    def reload(self):
+        if self._busy:
+            return
+        self._busy = True
+        self._clear()
+        self._show_status("Loading chat history…")
+        threading.Thread(target=self._fetch, daemon=True).start()
+
+    def _fetch(self):
+        try:
+            from core.chat_history import fetch_history
+            rows = fetch_history()
+            QTimer.singleShot(0, lambda: self._loaded_rows(rows))
+        except Exception as exc:
+            QTimer.singleShot(0, lambda: self._load_failed(str(exc)))
+
+    def _clear(self):
+        while self._rows.count():
+            item = self._rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _show_status(self, text: str):
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet(f"color: {C.TEXT_MED}; padding: 8px;")
+        self._rows.addWidget(label)
+        self._rows.addStretch()
+
+    def _loaded_rows(self, rows: list[dict]):
+        self._busy = False
+        self._loaded = True
+        self._clear()
+        if not rows:
+            self._show_status(
+                "No saved messages yet. Configure Neon and start a conversation."
+            )
+            return
+        for row in rows:
+            self._add_row(row)
+        self._rows.addStretch()
+
+    def _load_failed(self, error: str):
+        self._busy = False
+        self._clear()
+        self._show_status(f"History unavailable: {error}")
+
+    def _add_row(self, row: dict):
+        sender = str(row.get("sender_name") or row.get("sender_id") or "Unknown")
+        content = str(row.get("message_content") or "")
+        stamp = str(row.get("sent_at") or "")
+        try:
+            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            date_text = parsed.astimezone().strftime("%Y-%m-%d")
+            time_text = parsed.astimezone().strftime("%H:%M")
+        except ValueError:
+            date_text, time_text = stamp[:10] or "Unknown date", stamp[11:16]
+        snippet = " ".join(content.split())
+        if len(snippet) > 58:
+            snippet = snippet[:55] + "…"
+
+        header = QPushButton(f"{sender}  •  {snippet}\n{date_text}  {time_text}")
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
+        header.setStyleSheet(f"""
+            QPushButton {{
+                text-align: left; color: {C.TEXT}; background: {C.PANEL2};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 6px;
+            }}
+            QPushButton:hover {{ border-color: {C.PRI_DIM}; color: {C.PRI}; }}
+        """)
+        detail = QLabel(content)
+        detail.setWordWrap(True)
+        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail.setStyleSheet(
+            f"color: {C.TEXT_MED}; background: {C.PANEL}; "
+            f"border: 1px solid {C.BORDER}; padding: 7px;"
+        )
+        detail.setVisible(False)
+        header.clicked.connect(
+            lambda checked=False, panel=detail:
+            panel.setVisible(not panel.isVisible())
+        )
+        self._rows.addWidget(header)
+        self._rows.addWidget(detail)
 
 _FILE_ICONS = {
     "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),
@@ -2947,10 +3034,6 @@ class MainWindow(QMainWindow):
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
-    _video_open_sig  = pyqtSignal(str, str, bool, str)  # video, title, muted, audio
-    _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
-    _video_close_sig = pyqtSignal()
-    _video_mute_sig  = pyqtSignal(bool)
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
@@ -3057,128 +3140,10 @@ class MainWindow(QMainWindow):
         )
         _cam_v.addWidget(self._cam_live_lbl, stretch=1)
 
-        # ── Video surface ────────────────────────────────────────────────
-        # Built exactly like the camera page above and stacked beside it,
-        # because it is the same idea: something takes the centre of the HUD
-        # for a while and then gives it back. Sharing the stack rather than
-        # inventing a second mechanism means the avatar, the camera and a video
-        # can never be on screen at once.
-        self._video_split = False        # is the sound a separate stream?
-        self._video_auto_muted = False   # did JARVIS close the mic, or the user?
-        # A plain flag rather than reading the widget. video_is_playing() is
-        # called from plugin threads, and reading a widget's state from one is
-        # not something to rely on; an attribute is.
-        self._video_on = False
-        self._video_cont = QWidget()
-        self._video_cont.setStyleSheet(f"background: {C.BG};")
-        _vid_v = QVBoxLayout(self._video_cont)
-        _vid_v.setContentsMargins(8, 6, 8, 8)
-        _vid_v.setSpacing(4)
-
-        _vid_hdr = QHBoxLayout()
-        self._video_title = QLabel("▶  VIDEO")
-        self._video_title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        self._video_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        _vid_hdr.addWidget(self._video_title)
-        _vid_hdr.addStretch()
-
-        def _vid_btn(text: str) -> QPushButton:
-            b = QPushButton(text)
-            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(f"""
-                QPushButton {{
-                    color: {C.TEXT_DIM}; background: transparent;
-                    border: none; padding: 2px 6px;
-                }}
-                QPushButton:hover {{ color: {C.PRI}; }}
-            """)
-            return b
-
-        # Muted is the default and the button says so, because a soundtrack
-        # talking over JARVIS is the one way this feature could make the
-        # assistant worse rather than better.
-        self._video_mute_btn = _vid_btn("🔇  SOUND OFF")
-        self._video_mute_btn.clicked.connect(self._toggle_video_mute)
-        _vid_hdr.addWidget(self._video_mute_btn)
-
-        _vid_x = _vid_btn("✕  CLOSE")
-        _vid_x.clicked.connect(self.stop_video)
-        _vid_hdr.addWidget(_vid_x)
-        _vid_v.addLayout(_vid_hdr)
-
-        if HAVE_VIDEO:
-            # A GRAPHICS ITEM, NOT A QVideoWidget.
-            #
-            # QVideoWidget gets a native window of its own, and a native window
-            # is painted by the compositor above every ordinary widget that
-            # shares the screen with it — so the settings drawer opened
-            # *underneath* the video and raise_() could not help, because the
-            # two are not in the same painting order at all. A video item drawn
-            # into a QGraphicsView goes through Qt's own painter like any other
-            # widget, and anything laid over it stays over it.
-            self._video_scene = QGraphicsScene(self)
-            self._video_item = QGraphicsVideoItem()
-            self._video_scene.addItem(self._video_item)
-            self._video_widget = QGraphicsView(self._video_scene)
-            self._video_widget.setStyleSheet("background: #000; border: none;")
-            self._video_widget.setFrameShape(QGraphicsView.Shape.NoFrame)
-            self._video_widget.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            self._video_widget.setVerticalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            self._video_widget.setSizePolicy(
-                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-            )
-            _vid_v.addWidget(self._video_widget, stretch=1)
-
-            self._video_audio = QAudioOutput()
-            self._video_audio.setMuted(True)
-            self._video_player = QMediaPlayer()
-            self._video_player.setVideoOutput(self._video_item)
-            # Keep the picture filling the view as the window is resized.
-            self._video_item.nativeSizeChanged.connect(self._fit_video)
-            self._video_player.setAudioOutput(self._video_audio)
-            self._video_player.errorOccurred.connect(self._on_video_error)
-
-            # A SECOND player, for sound that arrives separately.
-            #
-            # YouTube no longer serves a single stream carrying both picture and
-            # sound — not for new uploads and not for old ones; checked against
-            # three videos including the oldest on the site, and every one of
-            # them offered zero combined formats. Picture and sound are two
-            # URLs, so they are two players, started together and nudged back
-            # into line by the timer below.
-            #
-            # A local file or a direct video URL still uses the first player
-            # alone: one stream, one player, nothing to synchronise.
-            self._video_sound = QMediaPlayer()
-            self._video_sound_out = QAudioOutput()
-            self._video_sound_out.setMuted(True)
-            self._video_sound.setAudioOutput(self._video_sound_out)
-
-            self._video_sync = QTimer(self)
-            self._video_sync.setInterval(1000)
-            self._video_sync.timeout.connect(self._sync_video_sound)
-        else:
-            self._video_scene = None
-            self._video_item = None
-            self._video_widget = None
-            self._video_player = None
-            self._video_audio = None
-            self._video_sound = None
-            self._video_sound_out = None
-            self._video_sync = None
-            _miss = QLabel("Video playback is not available in this Qt install.")
-            _miss.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            _miss.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-            _vid_v.addWidget(_miss, stretch=1)
-
-        # Stack: 0 = animated HUD, 1 = live camera, 2 = video
+        # Stack: 0 = animated HUD, 1 = live camera
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self.hud)
         self._hud_cam_stack.addWidget(_cam_cont)
-        self._hud_cam_stack.addWidget(self._video_cont)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -3206,8 +3171,6 @@ class MainWindow(QMainWindow):
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
-        self._ctrl_drawer = self._build_controls_drawer()
-        self._warm_wake_state()
         self._update_autostart_btn(self._check_autostart())
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
@@ -3232,10 +3195,6 @@ class MainWindow(QMainWindow):
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
-        self._wake_btns_sig.connect(self._refresh_wake_btns)
-        self._video_open_sig.connect(self._on_video_open)
-        self._video_close_sig.connect(self._on_video_close)
-        self._video_mute_sig.connect(self._on_video_mute)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
         self._quiz_sig.connect(self._show_quiz)
@@ -3308,7 +3267,7 @@ class MainWindow(QMainWindow):
             cam_idx = 0
             try:
                 import json as _j
-                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text())
+                cfg = _j.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                 cam_idx = int(cfg.get("camera_index", 0))
             except Exception:
                 pass
@@ -3337,154 +3296,6 @@ class MainWindow(QMainWindow):
 
     def stop_camera_stream(self) -> None:
         self._cam_stop.set()
-
-    # --- Video in the HUD area ---------------------------------------------
-    #
-    # Everything below runs on the Qt thread. Plugins and the assistant reach it
-    # through the signals above, the same way every other panel is driven, so a
-    # background thread never touches a widget.
-    def _on_video_open(self, source: str, title: str, muted: bool,
-                       audio_source: str = "") -> None:
-        if not HAVE_VIDEO or not self._video_player:
-            self.write_log("SYS: Video playback is not available in this Qt "
-                           "install.")
-            return
-        # A video and the live camera cannot share the centre of the HUD.
-        self._cam_stop.set()
-
-        self._video_title.setText(f"▶  {(title or 'VIDEO')[:44].upper()}")
-        self._video_split = bool(audio_source)
-        self._set_video_muted(bool(muted))
-
-        url = (QUrl.fromLocalFile(source) if Path(source).exists()
-               else QUrl(source))
-        self._video_player.setSource(url)
-        if self._video_split:
-            self._video_sound.setSource(QUrl(audio_source))
-        self._hud_cam_stack.setCurrentIndex(2)
-        self._video_on = True
-        # Re-run now that the video counts as playing: _set_video_muted ran
-        # before this line and saw no video, so its mic check was a no-op.
-        self._sync_mic_for_video()
-        self._video_player.play()
-        if self._video_split:
-            self._video_sound.play()
-            self._video_sync.start()
-
-    def _fit_video(self, *_a) -> None:
-        """Size the picture to the panel, keeping its shape."""
-        if not (self._video_item and self._video_widget):
-            return
-        try:
-            native = self._video_item.nativeSize()
-            if native.isEmpty():
-                return
-            view = self._video_widget.viewport().size()
-            scale = min(view.width() / native.width(),
-                        view.height() / native.height())
-            w, h = native.width() * scale, native.height() * scale
-            self._video_item.setSize(QSizeF(w, h))
-            self._video_scene.setSceneRect(0, 0, w, h)
-            self._video_widget.centerOn(self._video_item)
-        except Exception:
-            pass
-
-    def _on_video_close(self) -> None:
-        if self._video_sync:
-            self._video_sync.stop()
-        for p in (self._video_player, self._video_sound):
-            if p:
-                p.stop()
-                p.setSource(QUrl())
-        self._video_split = False
-        self._video_on = False
-        self._hud_cam_stack.setCurrentIndex(0)
-        self._sync_mic_for_video()      # gives the microphone back
-
-    def _set_video_muted(self, muted: bool) -> None:
-        """Silence whichever output is carrying the sound for this video."""
-        muted = bool(muted)
-        if self._video_audio:
-            # When the sound is a separate stream this player has none, but
-            # muting it too costs nothing and keeps the two paths identical.
-            self._video_audio.setMuted(muted)
-        if self._video_sound_out:
-            self._video_sound_out.setMuted(muted)
-        self._sync_video_mute_btn()
-        self._sync_mic_for_video()
-
-    def _on_video_mute(self, muted: bool) -> None:
-        self._set_video_muted(muted)
-
-    def _sync_mic_for_video(self) -> None:
-        """Close the microphone while the video is making sound.
-
-        JARVIS subtracts its OWN output from the microphone — that is what
-        core/echo.py does — but a video plays through a different output
-        entirely, so the guard has never heard of it and the assistant answers
-        the film. There is no arrangement in which an open microphone and a
-        loudspeaker in the same room do not do that.
-
-        So the microphone closes for exactly as long as the sound is on, and
-        opens again by itself the moment it goes off or the video is closed.
-        Only if JARVIS closed it: a microphone the user muted themselves stays
-        muted, and pressing the mute key during a video hands the decision back
-        to them for good.
-        """
-        sound_on = bool(self._video_on and self._video_sound_out
-                        and not self._video_sound_out.isMuted())
-        if sound_on and not self._muted:
-            self._video_auto_muted = True
-            self._set_muted(True, "The video's sound is on — silence it, close "
-                                  "it, or press F4 to talk. Typing still works.")
-        elif not sound_on and self._video_auto_muted:
-            self._video_auto_muted = False
-            self._set_muted(False, "The video is quiet again.")
-
-    def _sync_video_sound(self) -> None:
-        """Keep the separate soundtrack in step with the picture.
-
-        Two players started at the same moment do not stay together: they buffer
-        independently, and measured on a real stream they were about half a
-        second apart after nine seconds. So the sound is nudged back to the
-        picture whenever it drifts far enough to hear — and only then, because
-        correcting a smaller gap is itself audible.
-        """
-        if not (self._video_split and self._video_sound and self._video_player):
-            return
-        try:
-            if self._video_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                return
-            drift = self._video_sound.position() - self._video_player.position()
-            if abs(drift) > 300:
-                self._video_sound.setPosition(self._video_player.position())
-        except Exception:
-            pass
-
-    def _sync_video_mute_btn(self) -> None:
-        out = self._video_sound_out if self._video_split else self._video_audio
-        muted = bool(out and out.isMuted())
-        self._video_mute_btn.setText("🔇  SOUND OFF" if muted else "🔊  SOUND ON")
-
-    def _toggle_video_mute(self) -> None:
-        out = self._video_sound_out if self._video_split else self._video_audio
-        if out:
-            self._set_video_muted(not out.isMuted())
-
-    def _on_video_error(self, *_a) -> None:
-        err = ""
-        try:
-            err = self._video_player.errorString()
-        except Exception:
-            pass
-        self.write_log(f"SYS: The video could not be played{(' — ' + err) if err else ''}.")
-        self._on_video_close()
-
-    def stop_video(self) -> None:
-        self._video_close_sig.emit()
-
-    def video_is_playing(self) -> bool:
-        return bool(self._video_on)
 
     # ------------------------------------------------------------------
     # Icon generation — arc-reactor style, rendered with Pillow
@@ -3875,9 +3686,6 @@ class MainWindow(QMainWindow):
         # Quick drawer — reposition if open
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
-        if hasattr(self, '_ctrl_drawer') and self._ctrl_drawer.isVisible():
-            self._position_ctrl_drawer()
-        self._fit_video()
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
@@ -3959,26 +3767,8 @@ class MainWindow(QMainWindow):
             QPushButton:checked {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
         """)
         self._drawer_btn.setCheckable(True)
-        self._drawer_btn.setToolTip("Setup — things you set once")
         self._drawer_btn.clicked.connect(self._toggle_drawer)
         lay.addWidget(self._drawer_btn)
-
-        # A SECOND drawer, and the split is by how often a thing is touched.
-        #
-        # One panel held twelve buttons: the ones you press once when you set
-        # the assistant up sitting next to the ones you flick on and off every
-        # day. Separating them by that — setup behind ⚙, everyday behind 🎛 —
-        # is what makes each list short enough to read at a glance.
-        self._ctrl_btn = QPushButton("🎛")
-        self._ctrl_btn.setFixedSize(26, 26)
-        self._ctrl_btn.setFont(QFont("Courier New", 11))
-        self._ctrl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ctrl_btn.setToolTip("Controls — the everyday switches")
-        self._ctrl_btn.setStyleSheet(self._drawer_btn.styleSheet())
-        self._ctrl_btn.setCheckable(True)
-        self._ctrl_btn.clicked.connect(self._toggle_controls)
-        lay.addSpacing(4)
-        lay.addWidget(self._ctrl_btn)
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -4104,7 +3894,20 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
-        lay.addWidget(self._log, stretch=1)
+        self._history = HistoryWidget()
+        self._log_tabs = QTabWidget()
+        self._log_tabs.addTab(self._log, "LIVE")
+        self._log_tabs.addTab(self._history, "HISTORY")
+        self._log_tabs.currentChanged.connect(self._on_log_tab_changed)
+        self._log_tabs.setStyleSheet(f"""
+            QTabWidget::pane {{ border: none; }}
+            QTabBar::tab {{
+                color: {C.TEXT_MED}; background: {C.PANEL2};
+                border: 1px solid {C.BORDER}; padding: 4px 10px;
+            }}
+            QTabBar::tab:selected {{ color: {C.PRI}; border-bottom-color: {C.PRI}; }}
+        """)
+        lay.addWidget(self._log_tabs, stretch=1)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -4157,6 +3960,10 @@ class MainWindow(QMainWindow):
 
         return w
 
+    def _on_log_tab_changed(self, index: int):
+        if index == 1:
+            self._history.reload()
+
     def _build_quick_drawer(self) -> QWidget:
         """Floating overlay panel shown when the ⚙ header button is toggled."""
         _BTN_STYLE_PRI = f"""
@@ -4176,7 +3983,6 @@ class MainWindow(QMainWindow):
             QPushButton:hover {{ color: {C.PRI}; border-color: {C.BORDER_B}; }}
         """
 
-        self._BTN_PRI, self._BTN_DIM = _BTN_STYLE_PRI, _BTN_STYLE_DIM
         w = QWidget(self.centralWidget())
         w.setObjectName("QuickDrawer")
         w.setStyleSheet(f"""
@@ -4193,7 +3999,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(10, 8, 10, 10)
         lay.setSpacing(5)
 
-        hdr = QLabel("◈ SETUP")
+        hdr = QLabel("◈ CONTROLS")
         hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; "
                           f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
@@ -4206,6 +4012,14 @@ class MainWindow(QMainWindow):
         remote_btn.setStyleSheet(_BTN_STYLE_PRI)
         remote_btn.clicked.connect(self._open_remote)
         lay.addWidget(remote_btn)
+
+        fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
+        fs_btn.setFixedHeight(26)
+        fs_btn.setFont(QFont("Courier New", 7))
+        fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        fs_btn.setStyleSheet(_BTN_STYLE_DIM)
+        fs_btn.clicked.connect(self._toggle_fullscreen)
+        lay.addWidget(fs_btn)
 
         sc_btn = QPushButton("⊞  CREATE DESKTOP SHORTCUT")
         sc_btn.setFixedHeight(26)
@@ -4229,6 +4043,50 @@ class MainWindow(QMainWindow):
         cust_btn.setStyleSheet(_BTN_STYLE_DIM)
         cust_btn.clicked.connect(self._open_customize)
         lay.addWidget(cust_btn)
+
+        self._brief_btn = QPushButton()
+        self._brief_btn.setFixedHeight(26)
+        self._brief_btn.setFont(QFont("Courier New", 7))
+        self._brief_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._brief_btn.clicked.connect(self._toggle_brief)
+        lay.addWidget(self._brief_btn)
+
+        # ── Wake word ──────────────────────────────────────────────────────────
+        self._wake_btn = QPushButton()
+        self._wake_btn.setFixedHeight(26)
+        self._wake_btn.setFont(QFont("Courier New", 7))
+        self._wake_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._wake_btn.clicked.connect(self._toggle_wake_word)
+        lay.addWidget(self._wake_btn)
+
+        self._wake_sleep_btn = QPushButton()
+        self._wake_sleep_btn.setFixedHeight(26)
+        self._wake_sleep_btn.setFont(QFont("Courier New", 7))
+        self._wake_sleep_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._wake_sleep_btn.clicked.connect(self._tap_wake_manual)
+        lay.addWidget(self._wake_sleep_btn)
+        # Neutral placeholder now; the real state (which may load the model to
+        # check readiness) is resolved lazily the first time the drawer opens.
+        self._wake_btn.setText("🎙  WAKE WORD")
+        self._wake_btn.setStyleSheet(_BTN_STYLE_DIM)
+        self._wake_sleep_btn.hide()
+
+        self._ptt_btn = QPushButton()
+        self._ptt_btn.setFixedHeight(26)
+        self._ptt_btn.setFont(QFont("Courier New", 7))
+        self._ptt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ptt_btn.clicked.connect(self._toggle_ptt)
+        lay.addWidget(self._ptt_btn)
+
+        self._refresh_talk_btns()
+
+        self._hud_btn = QPushButton()
+        self._hud_btn.setFixedHeight(26)
+        self._hud_btn.setFont(QFont("Courier New", 7))
+        self._hud_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hud_btn.clicked.connect(self._toggle_hud_style)
+        lay.addWidget(self._hud_btn)
+        self._refresh_hud_btn()
 
         audio_btn = QPushButton("🎧  AUDIO DEVICES")
         audio_btn.setFixedHeight(26)
@@ -4265,127 +4123,22 @@ class MainWindow(QMainWindow):
         w.adjustSize()
         return w
 
-    def _build_controls_drawer(self) -> QWidget:
-        """The switches that get flicked every day, in their own panel."""
-        w = QWidget(self.centralWidget())
-        w.setObjectName("QuickDrawer")
-        w.setStyleSheet(self._quick_drawer.styleSheet())
-        w.hide()
-
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(10, 8, 10, 10)
-        lay.setSpacing(5)
-
-        hdr = QLabel("◈ CONTROLS")
-        hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; "
-                          f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
-        lay.addWidget(hdr)
-
-        def _row(button, style=None, height=26):
-            button.setFixedHeight(height)
-            button.setFont(QFont("Courier New", 7))
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            if style:
-                button.setStyleSheet(style)
-            lay.addWidget(button)
-            return button
-
-        fs_btn = _row(QPushButton("⛶  FULLSCREEN  [F11]"), self._BTN_DIM)
-        fs_btn.clicked.connect(self._toggle_fullscreen)
-
-        self._brief_btn = _row(QPushButton())
-        self._brief_btn.clicked.connect(self._toggle_brief)
-
-        self._wake_btn = _row(QPushButton())
-        self._wake_btn.clicked.connect(self._toggle_wake_word)
-        self._wake_sleep_btn = _row(QPushButton())
-        self._wake_sleep_btn.clicked.connect(self._tap_wake_manual)
-        # Neutral until the real state lands from the background warm-up.
-        self._wake_btn.setText("🎙  WAKE WORD")
-        self._wake_btn.setStyleSheet(self._BTN_DIM)
-        self._wake_sleep_btn.hide()
-
-        self._ptt_btn = _row(QPushButton())
-        self._ptt_btn.clicked.connect(self._toggle_ptt)
-        self._refresh_talk_btns()
-
-        self._hud_btn = _row(QPushButton())
-        self._hud_btn.clicked.connect(self._toggle_hud_style)
-        self._refresh_hud_btn()
-
-        w.adjustSize()
-        return w
-
-    def _warm_wake_state(self) -> None:
-        """Work out the wake-word state off the UI thread, once.
-
-        It used to be resolved when the drawer opened, and that made opening the
-        drawer take two seconds the first time — measured at 2.10s, all of it
-        `import openwakeword` dragging in onnxruntime behind it. The button
-        count had nothing to do with it; the Qt thread was simply waiting on an
-        import. Afterwards the same check costs about a millisecond, so it only
-        ever needed to happen somewhere other than in front of the user.
-        """
-        def work():
-            try:
-                self._wake_state()
-            except Exception:
-                pass
-            self._wake_btns_sig.emit()
-        threading.Thread(target=work, daemon=True, name="wake-state-warm").start()
-
     def _toggle_drawer(self, checked: bool):
         if checked:
-            self._close_controls()
+            self._refresh_wake_btns()   # resolve wake state on open (lazy)
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
         else:
             self._quick_drawer.hide()
 
-    def _toggle_controls(self, checked: bool):
-        if checked:
-            self._close_setup()
-            self._refresh_wake_btns()   # cheap now: the state was warmed at boot
-            self._position_ctrl_drawer()
-            self._ctrl_drawer.show()
-            self._ctrl_drawer.raise_()
-        else:
-            self._ctrl_drawer.hide()
-
-    def _close_setup(self):
-        if hasattr(self, "_quick_drawer"):
-            self._quick_drawer.hide()
-        if hasattr(self, "_drawer_btn"):
-            self._drawer_btn.setChecked(False)
-
-    def _close_controls(self):
-        if hasattr(self, "_ctrl_drawer"):
-            self._ctrl_drawer.hide()
-        if hasattr(self, "_ctrl_btn"):
-            self._ctrl_btn.setChecked(False)
-
-    def _place_drawer(self, drawer, left: int):
-        _W = 220
-        drawer.setFixedWidth(_W)
-        drawer.adjustSize()
-        drawer.setGeometry(left, 54, _W, drawer.sizeHint().height())
-
     def _position_quick_drawer(self):
-        if hasattr(self, "_quick_drawer"):
-            self._place_drawer(self._quick_drawer, 12)
-
-    def _position_ctrl_drawer(self):
-        # Under its own header button rather than under the other one's.
-        if hasattr(self, "_ctrl_drawer"):
-            left = 12
-            try:
-                left = max(12, self._ctrl_btn.mapTo(self.centralWidget(),
-                                                    QPoint(0, 0)).x() - 8)
-            except Exception:
-                pass
-            self._place_drawer(self._ctrl_drawer, left)
+        if not hasattr(self, '_quick_drawer'):
+            return
+        _W = 220
+        self._quick_drawer.setFixedWidth(_W)
+        self._quick_drawer.adjustSize()
+        self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
@@ -4894,7 +4647,8 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
         lay.addStretch()
-        lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
+        lay.addWidget(_fl("By Washim" \
+        "", C.PRI_DIM))
         return w
 
     def _on_file_selected(self, path: str):
@@ -5362,12 +5116,15 @@ class MainWindow(QMainWindow):
                 voice_changed = True
 
         try:
-            data = _read_full_config()
-            data["assistant_name"] = self._assistant_name
-            data["user_name"] = user_name.strip()
+            from memory.config_manager import update_config
+
+            fields = {
+                "assistant_name": self._assistant_name,
+                "user_name": user_name.strip(),
+            }
             if ui_color:
-                data["ui_color"] = ui_color.strip().lower()
-            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+                fields["ui_color"] = ui_color.strip().lower()
+            update_config(**fields)
             self._log.append_log(f"SYS: Identity updated — {display}")
             if color_changed:
                 self._log.append_log(f"SYS: UI colour applied — {ui_color}")
@@ -5501,24 +5258,15 @@ class MainWindow(QMainWindow):
             self.on_interrupt()
 
     def _toggle_mute(self):
-        # A deliberate press settles the question: whatever the video did, or is
-        # about to do, the user has now said what they want.
-        self._video_auto_muted = False
-        self._set_muted(not self._muted)
-
-    def _set_muted(self, muted: bool, note: str = ""):
-        muted = bool(muted)
-        if muted == self._muted:
-            return
-        self._muted = muted
-        self.hud.muted = muted
+        self._muted = not self._muted
+        self.hud.muted = self._muted
         self._style_mute_btn()
-        if muted:
+        if self._muted:
             self._apply_state("MUTED")
-            self._log.append_log("SYS: Microphone muted." + (f" {note}" if note else ""))
+            self._log.append_log("SYS: Microphone muted.")
         else:
             self._apply_state("LISTENING")
-            self._log.append_log("SYS: Microphone active." + (f" {note}" if note else ""))
+            self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):
         if self._muted:
@@ -5573,11 +5321,13 @@ class MainWindow(QMainWindow):
         self._overlay = ov
 
     def _on_setup_done(self, key: str, os_name: str):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        try:
+            from memory.config_manager import update_config
+            update_config(gemini_api_key=key.strip(), os_system=os_name)
+        except (OSError, ValueError) as exc:
+            self._log.append_log(f"ERR: Could not save configuration: {exc}")
+            self._key_input.setFocus()
+            return
         self._ready = True
         if self._overlay:
             self._overlay.hide()
@@ -5800,34 +5550,6 @@ class JarvisUI:
     def show_camera_frame(self, img_bytes: bytes):
         """Thread-safe: show a webcam frame in the small overlay (screen captures)."""
         self._win._camera_sig.emit(img_bytes)
-
-    def show_video(self, source: str, title: str = "", muted: bool = True,
-                   audio_source: str = "") -> None:
-        """Thread-safe: play a video where the avatar normally is.
-
-        `source` is a local path or a direct media URL. `audio_source` is for
-        the case where the sound arrives as its own stream — YouTube serves no
-        combined format any more — and when it is given the two are played
-        together and kept in step.
-
-        Muted by default, and that is a decision rather than a default: a
-        soundtrack talking over JARVIS is the one way this could make the
-        assistant worse. The user turns sound on from the header button or by
-        asking, and closes it the same two ways.
-        """
-        self._win._video_open_sig.emit(str(source or ""), str(title or ""),
-                                       bool(muted), str(audio_source or ""))
-
-    def stop_video(self) -> None:
-        """Thread-safe: close the video and give the HUD back to the avatar."""
-        self._win._video_close_sig.emit()
-
-    def set_video_muted(self, muted: bool) -> None:
-        """Thread-safe: silence or unsilence whatever is playing."""
-        self._win._video_mute_sig.emit(bool(muted))
-
-    def video_is_playing(self) -> bool:
-        return bool(self._win.video_is_playing())
 
     def start_camera_stream(self) -> None:
         """Thread-safe: start live camera feed in the full HUD area."""

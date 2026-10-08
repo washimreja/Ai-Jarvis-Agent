@@ -1,9 +1,12 @@
 import json
+import os
 import re
+import tempfile
 from datetime import datetime
 from threading import Lock
 from pathlib import Path
 import sys
+from core.paths import MEMORY_FILE
 
 
 def get_base_dir() -> Path:
@@ -12,8 +15,8 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-BASE_DIR         = get_base_dir()
-MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
+BASE_DIR = get_base_dir()
+MEMORY_PATH = MEMORY_FILE
 _lock            = Lock()
 MAX_VALUE_LENGTH = 380
 
@@ -119,12 +122,27 @@ def save_memory(memory: dict) -> None:
     if not isinstance(memory, dict):
         return
     memory = _trim_to_limit(memory)
+    _write_memory(memory)
+
+
+def _write_memory(memory: dict) -> None:
     MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    fd, temp_name = tempfile.mkstemp(
+        prefix="long_term.", suffix=".tmp", dir=str(MEMORY_PATH.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(memory, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, MEMORY_PATH)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _truncate_value(val: str) -> str:
@@ -446,11 +464,7 @@ def save_session_summary(summary: str, language: str = "") -> None:
     sessions.append(entry)
     memory["sessions"] = sessions[-_SESSION_MAX:]
     with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        _write_memory(memory)
     print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 
@@ -469,10 +483,7 @@ def pop_last_session() -> dict | None:
                 return None
             entry = sessions.pop()          # remove the last entry
             memory["sessions"] = sessions
-            MEMORY_PATH.write_text(
-                json.dumps(memory, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            _write_memory(memory)
             return entry
         except Exception as e:
             print(f"[Memory] ⚠️ pop_last_session error: {e}")

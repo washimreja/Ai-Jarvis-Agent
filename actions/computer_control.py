@@ -1,4 +1,5 @@
 #computer_control.py
+from core.permissions import ActionPermission, requires_permission
 import io
 import json
 import platform
@@ -14,6 +15,7 @@ else:
 import time
 import random
 from pathlib import Path
+from core.paths import CONFIG_FILE, MEMORY_FILE
 
 try:
     import pyautogui
@@ -35,9 +37,9 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-_BASE         = _base_dir()
-_CONFIG_PATH  = _BASE / "config" / "api_keys.json"
-_MEMORY_PATH  = _BASE / "memory" / "long_term.json"
+_BASE = _base_dir()
+_CONFIG_PATH = CONFIG_FILE
+_MEMORY_PATH = MEMORY_FILE
 
 def _load_config() -> dict:
     try:
@@ -177,6 +179,30 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
     pyautogui.typewrite(text, interval=0.04)
     return f"Smart-typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
+
+def _verify_and_click(x=None, y=None, button: str = "left", clicks: int = 1, role_name: str = None, control_type: str = None) -> str:
+    """Robust target resolution: Accessibility roles first, fallback to coordinates."""
+    try:
+        import pywinauto
+        if role_name or control_type:
+            try:
+                app = pywinauto.Desktop(backend="uia")
+                # Try finding by name or control type
+                kwargs = {}
+                if role_name:
+                    kwargs["title_re"] = f".*{role_name}.*"
+                if control_type:
+                    kwargs["control_type"] = control_type
+                if kwargs:
+                    element = app.window(**kwargs).wrapper_object()
+                    element.click_input(button=button, double=(clicks==2))
+                    return f"Clicked via Accessibility Role: {role_name or control_type}"
+            except Exception as e:
+                print(f"[Target Verification] UIA failed for {role_name}/{control_type}: {e}. Falling back to coordinates.")
+    except ImportError:
+        pass
+
+    return _click(x, y, button, clicks)
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
     _require_pyautogui()
@@ -355,6 +381,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
 
     return None
 
+@requires_permission(ActionPermission.SIDE_EFFECTING)
 def computer_control(
     parameters: dict,
     response=None,
@@ -425,11 +452,20 @@ def computer_control(
                 clear_first=params.get("clear_first", True),
             )
 
-        if action in ("click", "left_click"):
+        if action == "left_click":
             return _click(params.get("x"), params.get("y"), "left", 1)
 
         if action == "double_click":
             return _click(params.get("x"), params.get("y"), "left", 2)
+
+        if action == "click":
+            return _verify_and_click(
+                params.get("x"), params.get("y"), 
+                params.get("button", "left"), 
+                params.get("clicks", 1),
+                params.get("role_name"),
+                params.get("control_type")
+            )
 
         if action == "right_click":
             return _click(params.get("x"), params.get("y"), "right", 1)

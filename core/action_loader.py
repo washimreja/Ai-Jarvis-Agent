@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.action_policy import ActionRisk, get_action_risk, requires_confirmation
+
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
 _CTX_KEYS = ("player", "speak", "response", "session_memory")
@@ -101,6 +103,29 @@ class ActionRegistry:
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
         try:
+            req_perm = getattr(rec.handler, "_required_permission", None)
+            risk = get_action_risk(name, parameters)
+
+            from core.permissions import ActionPermission
+
+            if requires_confirmation(name, parameters, req_perm):
+                from core import confirm
+                return confirm.request(
+                    key=name,
+                    title=f"Allow {name}?",
+                    detail=(
+                        f"Requires explicit confirmation before this action can run. "
+                        f"Risk: {risk.value}."
+                    ),
+                    run=lambda: _call_handler(rec.handler, parameters, ctx or {}) or "Done."
+                )
+
+            if req_perm == ActionPermission.SIDE_EFFECTING:
+                self._logger(f"[Auto-Approved] {name} (Requires {req_perm.name})")
+            elif risk == ActionRisk.CONTEXTUAL:
+                self._logger(f"[Contextual] {name} (Risk: {risk.value})")
+            else:
+                self._logger(f"[Trusted] {name} (Risk: {risk.value})")
             return _call_handler(rec.handler, parameters, ctx or {}) or "Done."
         except Exception as e:
             self._logger(f"Action '{name}' crashed during run(): {e}")

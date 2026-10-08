@@ -12,6 +12,7 @@ import io
 import json
 import sys
 from pathlib import Path
+from core.paths import CONFIG_FILE
 
 import numpy as np
 
@@ -41,8 +42,8 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-_BASE        = _base_dir()
-_CONFIG_PATH = _BASE / "config" / "api_keys.json"
+_BASE = _base_dir()
+_CONFIG_PATH = CONFIG_FILE
 
 
 def _load_config() -> dict:

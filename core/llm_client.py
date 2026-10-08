@@ -23,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, Generator
+from core.paths import CONFIG_FILE
 
 import requests
 
@@ -36,8 +37,8 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-BASE_DIR    = get_base_dir()
-CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+BASE_DIR = get_base_dir()
+CONFIG_PATH = CONFIG_FILE
 
 _DEFAULTS = {
     "llm_url":      "http://localhost:11434",

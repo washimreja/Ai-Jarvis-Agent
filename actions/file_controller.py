@@ -1,3 +1,4 @@
+from core.permissions import ActionPermission, requires_permission
 import os
 import shutil
 import platform
@@ -645,6 +646,7 @@ def get_file_info(path: str, name: str = "") -> str:
     except Exception as e:
         return f"Could not get file info: {e}"
 
+@requires_permission(ActionPermission.DESTRUCTIVE)
 def file_controller(
     parameters: dict = None,
     response=None,

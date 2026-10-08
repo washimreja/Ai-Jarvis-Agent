@@ -1,8 +1,6 @@
 # config/__init__.py
 import json, os, platform
-from pathlib import Path
-
-_CONFIG_PATH = Path(__file__).parent / "api_keys.json"
+from core.paths import CONFIG_FILE as _CONFIG_PATH
 
 def _platform_os() -> str:
     """Auto-detect OS when config file is absent."""

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "neon": {
+      "source": "neondatabase/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/neon/SKILL.md",
+      "computedHash": "9e33579402f9c2d26d8e3575d3e52d9b4928958754a15af09b30a24b327b42ce"
+    },
+    "neon-postgres": {
+      "source": "neondatabase/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/neon-postgres/SKILL.md",
+      "computedHash": "d547bed55573754eecf55a26329ecdb116376815401efe26c0170a97789e39c5"
+    }
+  }
+}

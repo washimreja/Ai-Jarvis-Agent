@@ -41,6 +41,7 @@ import time
 import json
 import sys
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -71,9 +72,8 @@ from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
-    get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_wake_word_enabled, save_wake_word_enabled, get_input_device, get_output_device,
 )
-from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
@@ -84,6 +84,7 @@ from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
+from core.paths import CONFIG_FILE as USER_CONFIG_FILE
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
@@ -95,15 +96,8 @@ def get_base_dir():
     return Path(__file__).resolve().parent
 
 BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
+API_CONFIG_PATH = USER_CONFIG_FILE
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-# The conversation's model. A NAME, not a decision: the ladder lives in
-# core/gemini.py and this is only whichever rung is currently in use, kept here
-# as a module attribute because plugins read it (chat_takeover asks main for it
-# so that upgrading the assistant upgrades the plugin too).
-#
-# It is reassigned on every connect, so a model that runs out of quota is
-# stepped over and the assistant keeps talking instead of failing to start.
 LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000 
@@ -538,7 +532,8 @@ def _keep_context_of(exc: BaseException) -> bool:
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
-        self._asst_name     = "JARVI    S"   # updated each session from config
+        self._asst_name     = "JARVIS"     # updated each session from config
+        self._user_name     = ""            # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -606,6 +601,7 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._conversation_id = str(uuid.uuid4())
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -853,6 +849,29 @@ class JarvisLive:
             self._loop
         )
 
+    async def _persist_chat_message(self, content: str, sender_id: str, sender_name: str):
+        """Persist a completed turn without blocking the Gemini event loop."""
+        from core.chat_history import insert_message, is_configured, is_neon_configured
+
+        if not is_configured():
+            return
+        try:
+            await asyncio.to_thread(
+                insert_message,
+                content,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                conversation_id=self._conversation_id,
+                sent_at=datetime.now().astimezone(),
+            )
+            # Log Neon status on first successful write per session
+            if is_neon_configured() and not getattr(self, '_neon_confirmed', False):
+                self._neon_confirmed = True
+                self.ui.write_log("SYS: HISTORY: NEON ONLINE")
+        except Exception as exc:
+            error_type = type(exc).__name__
+            self.ui.write_log(f"ERR: Chat history save failed [{error_type}] — {exc}")
+
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
         return time.monotonic() < self._tail_until
@@ -965,9 +984,11 @@ class JarvisLive:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
             self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
+            self._user_name = _user_name
         except Exception:
             self._asst_name = "JARVIS"
             _user_name = ""
+            self._user_name = ""
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
@@ -1031,11 +1052,6 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": _all_decls}],
-            # Asks the server to issue session-resumption handles. Enabled but
-            # NOT yet used: no handle is captured from the resumption update and
-            # none is passed back here, so a reconnect starts a fresh session
-            # rather than continuing the old one. Left on because the handles
-            # cost nothing and are the prerequisite for doing it properly.
             # Hand back the handle captured from the last session_resumption
             # update. `handle=None` is exactly the old behaviour (ask for
             # handles, start fresh), so the first connect of a run is unchanged.
@@ -1127,9 +1143,25 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
-        self.ui.set_state("THINKING")
+        # -- Action dispatch diagnostic log (Tenth Phase requirement) ----------
+        # Resolves and logs risk level for every dispatched tool call so
+        # permission issues are visible in the activity log without guesswork.
+        try:
+            from core.action_policy import get_action_risk, requires_confirmation, ActionRisk
+            _risk = get_action_risk(name, args)
+            _needs_confirm = requires_confirmation(name, args)
+            _risk_label = _risk.value.upper()           # TRUSTED / CONTEXTUAL / HIGH_RISK
+            _confirm_label = "YES" if _needs_confirm else "NOT REQUIRED"
+            print(
+                f"[Dispatch] COMMAND: {name} | RESOLVED: {name} "
+                f"| RISK: {_risk_label} | CONFIRMATION: {_confirm_label}"
+            )
+        except Exception:
+            pass  # Diagnostic logging must never break dispatch
+        # -----------------------------------------------------------------------
 
+        print(f"[JARVIS] tool: {name}  args: {args}")
+        self.ui.set_state("THINKING")
 
         if name == "save_memory":
             category = args.get("category", "notes")
@@ -1369,7 +1401,7 @@ class JarvisLive:
             # unless you are holding the key.
             if self._ptt_enabled and not self._ptt_held:
                 return
-            
+
             if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
@@ -1547,6 +1579,10 @@ class JarvisLive:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+                                asyncio.create_task(self._persist_chat_message(
+                                    full_in, "local-user",
+                                    self._user_name if self._user_name else "You"
+                                ))
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -1566,6 +1602,9 @@ class JarvisLive:
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                asyncio.create_task(self._persist_chat_message(
+                                    full_out, "assistant", self._asst_name
+                                ))
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -1772,7 +1811,7 @@ class JarvisLive:
                        if lang else "")
         name_clause = f" Address the user as {name}." if name else ""
 
-        # Inject last session context if available — pop removes it so it's never repeated
+        # Inject last session context if available -- pop removes it so it's never repeated
         last = await asyncio.to_thread(pop_last_session)
         session_clause = ""
         if last:
@@ -1785,9 +1824,34 @@ class JarvisLive:
                 f" Also briefly and naturally mention that {_when}: {last['summary']}"
             )
 
+        # -- Neon history context --------------------------------------------------
+        # Fetch recent persisted messages and inject a concise silent summary so
+        # JARVIS has cross-session memory. Capped at 20 rows to keep token cost low.
+        neon_history_clause = ""
+        try:
+            from core.chat_history import fetch_history, is_neon_configured
+            if is_neon_configured():
+                _recent = await asyncio.to_thread(fetch_history, 20)
+                if _recent:
+                    _lines_h = []
+                    for _m in _recent[-10:]:  # last 10 of the fetched 20
+                        _nm = _m.get("sender_name") or _m.get("sender_id", "?")
+                        _ct = str(_m.get("message_content", ""))[:80]
+                        _lines_h.append(f"{_nm}: {_ct}")
+                    _history_snippet = " | ".join(_lines_h)
+                    neon_history_clause = (
+                        f" You have access to recent conversation history from the database:"
+                        f" [{_history_snippet}]. Use this context silently -- do not read it"
+                        f" aloud unless the user asks about past conversations."
+                    )
+                    self.ui.write_log("SYS: HISTORY: NEON ONLINE -- previous context loaded")
+        except Exception as _he:
+            # Non-fatal: history context is a nice-to-have, never a startup blocker
+            self.ui.write_log(f"SYS: HISTORY: could not load Neon context: {_he!r}")
+
         p1 = (
             f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
+            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}{neon_history_clause}"
         )
 
         # Clear the turn-done event so we can wait for Phase 1 to finish
@@ -2095,14 +2159,6 @@ class JarvisLive:
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
-                # Pick the rung to open the conversation on. A model resting
-                # off a quota limit is skipped; the name is published back to
-                # LIVE_MODEL so plugins follow whatever is actually in use.
-                global LIVE_MODEL
-                LIVE_MODEL = _gemini.live_model()
-                live_model = LIVE_MODEL
-                print(f"[JARVIS] Live model: {live_model}")
-
                 _resumed_with = self._resume_handle is not None
                 config = self._build_config()
 
@@ -2115,7 +2171,7 @@ class JarvisLive:
                 )
 
                 async with (
-                    client.aio.live.connect(model=live_model, config=config) as session,
+                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
@@ -2215,23 +2271,6 @@ class JarvisLive:
                 err_str = str(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
-
-                # Out of quota, or this model is not available to this key —
-                # step down the ladder and reconnect straight away. This is the
-                # difference between "JARVIS is quieter today" and "JARVIS does
-                # not start today": one model means one daily limit, and the
-                # limit always arrives mid-conversation.
-                if _gemini.note_live_failure(live_model, err_str):
-                    nxt = _gemini.live_model()
-                    self.ui.write_log(
-                        f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
-                        f"model is out of quota."
-                        if nxt != live_model else
-                        "SYS: Every live model is rate-limited — retrying.")
-                    self._conn_backoff = 0 if nxt != live_model else 15
-                    if nxt == live_model:
-                        await asyncio.sleep(self._conn_backoff)
-                    continue
 
                 # Turn-taking / media / thinking knobs rejected by the server
                 # (preview API drift) — drop them first, because they are the

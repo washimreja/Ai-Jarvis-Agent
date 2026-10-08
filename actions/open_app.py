@@ -2,6 +2,7 @@ import time
 import subprocess
 import platform
 import shutil
+import webbrowser
 
 try:
     import psutil
@@ -10,6 +11,23 @@ except ImportError:
     _PSUTIL = False
 
 _SYSTEM = platform.system()
+
+_SITE_TARGETS = {
+    "youtube": {
+        "name": "YouTube",
+        "url": "https://www.youtube.com",
+        "windows_names": ("YouTube", "YouTube (PWA)"),
+        "mac_app": "YouTube",
+        "linux_launchers": ("youtube", "youtube-pwa"),
+    },
+    "chatgpt": {
+        "name": "ChatGPT",
+        "url": "https://chatgpt.com",
+        "windows_names": ("ChatGPT", "ChatGPT (PWA)"),
+        "mac_app": "ChatGPT",
+        "linux_launchers": ("chatgpt", "chatgpt-pwa"),
+    },
+}
 
 _APP_ALIASES: dict[str, dict[str, str]] = {
 
@@ -76,6 +94,97 @@ def _normalize(raw: str) -> str:
             return os_map.get(_SYSTEM, raw)
 
     return raw  
+
+
+def _launch_windows_site_app(names: tuple[str, ...]) -> bool:
+    """Launch an installed Start-menu app/PWA with an exact matching name."""
+    quoted_names = ", ".join(f"'{name}'" for name in names)
+    command = (
+        f"$names = @({quoted_names}); "
+        "Get-StartApps | Where-Object { $names -contains $_.Name } "
+        "| Select-Object -First 1 -ExpandProperty AppID"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[open_app] Native-app lookup failed: {exc}")
+        return False
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+
+    app_id = result.stdout.strip().splitlines()[0]
+    try:
+        subprocess.Popen(
+            ["explorer.exe", f"shell:AppsFolder\\{app_id}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except OSError as exc:
+        print(f"[open_app] Native-app launch failed: {exc}")
+        return False
+
+
+def _launch_native_site_app(target: dict) -> bool:
+    if _SYSTEM == "Windows":
+        return _launch_windows_site_app(target["windows_names"])
+
+    if _SYSTEM == "Darwin":
+        try:
+            result = subprocess.run(
+                ["open", "-a", target["mac_app"]],
+                capture_output=True,
+                timeout=8,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"[open_app] Native-app launch failed: {exc}")
+            return False
+
+    if _SYSTEM == "Linux":
+        for launcher_name in target["linux_launchers"]:
+            try:
+                result = subprocess.run(
+                    ["gtk-launch", launcher_name],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+
+    return False
+
+
+def _open_site_in_browser(url: str) -> bool:
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except (OSError, webbrowser.Error) as exc:
+        print(f"[open_app] Browser fallback failed: {exc}")
+        return False
+
+
+def _open_site_target(app_name: str) -> str | None:
+    target = _SITE_TARGETS.get(app_name.lower().strip().removesuffix(".com"))
+    if target is None:
+        return None
+
+    if _launch_native_site_app(target):
+        return f"Opened {target['name']} app."
+    if _open_site_in_browser(target["url"]):
+        return f"Opened {target['name']} in your browser."
+    return (
+        f"Could not open {target['name']}: no matching native app was found "
+        "and the browser fallback failed."
+    )
+
 
 def _launch_windows(app_name: str) -> bool:
 
@@ -248,6 +357,10 @@ def open_app(
     if not app_name:
         return "No application name provided."
 
+    site_result = _open_site_target(app_name)
+    if site_result is not None:
+        return site_result
+
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
@@ -276,7 +389,7 @@ def open_app(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "open_app",
-    "description": "Opens any application on the computer. Use this whenever the user asks to open, launch, or start any app, website, or program. Always call this tool — never just say you opened it.",
+    "description": "Opens applications and websites. For YouTube and ChatGPT, first launch an installed native app or PWA, then fall back to the default browser. Use whenever the user asks to open, launch, or start an app, website, or program.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

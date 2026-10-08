@@ -17,6 +17,7 @@ import socket
 import string
 import time
 from pathlib import Path
+from core.paths import CONFIG_FILE
 
 _DEPS_OK = False
 try:
@@ -61,7 +62,7 @@ UPLOADS_DIR = _make_uploads_dir()
 def _get_gemini_key() -> str | None:
     try:
         import json as _json
-        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return _json.load(f).get("gemini_api_key")
     except Exception:
         return None
