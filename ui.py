@@ -9,7 +9,8 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from typing import Any
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
@@ -1077,13 +1078,183 @@ class LogWidget(QTextEdit):
             QTimer.singleShot(20, self._next)
 
 
+# ── Chat history helpers ─────────────────────────────────────────────────────
+# These are pure functions with no Qt dependency, so the
+# "Neon rows -> conversation list" transform can be unit-tested without a
+# QApplication (see tests/test_history_ui.py).
+
+_HIST_DEBUG = os.environ.get("JARVIS_HISTORY_DEBUG", "1") != "0"
+
+
+def _hist_log(msg: str) -> None:
+    """One-line breadcrumb for the HISTORY pipeline. Disable with
+    JARVIS_HISTORY_DEBUG=0. Never raises."""
+    if not _HIST_DEBUG:
+        return
+    try:
+        print(f"[History] {msg}", file=sys.stderr, flush=True)
+    except Exception:          # pragma: no cover — logging must never break UI
+        pass
+
+
+def _hist_parse_stamp(value: Any) -> datetime | None:
+    """Parse a `sent_at` value into a timezone-aware datetime.
+
+    Accepts real datetimes (psycopg returns aware ones for timestamptz),
+    ISO strings with `Z`/`+00:00` (the Data API and `_normalize_row`), and the
+    naive strings the SQLite fallback writes.  Naive stamps are read as UTC.
+    Returns None rather than raising when the value is unusable.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace("Z", "+00:00").replace("z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            try:               # "2026-10-08 09:00:00.123456+00" style text
+                dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _hist_bucket(when: datetime | None, *, now: datetime | None = None) -> str:
+    """Bucket key for the Today / Yesterday / Older sections."""
+    ref = (now or datetime.now(timezone.utc)).astimezone()
+    if when is None:
+        return "OLDER"
+    day = when.astimezone().date()
+    today = ref.date()
+    if day == today:
+        return "TODAY"
+    if day == today - timedelta(days=1):
+        return "YESTERDAY"
+    return "OLDER"
+
+
+# sender_id values main.py writes for JARVIS itself (`"assistant"`), plus the
+# obvious aliases, so the conversation title is taken from the human turn.
+_ASSISTANT_SENDERS = {"assistant", "jarvis", "ai", "system", "bot"}
+
+
+def _hist_is_user_row(row: dict) -> bool:
+    sender_id = str(row.get("sender_id") or "").strip().lower()
+    if sender_id:
+        return sender_id not in _ASSISTANT_SENDERS
+    name = str(row.get("sender_name") or "").strip().lower()
+    return name not in _ASSISTANT_SENDERS and "jarvis" not in name
+
+
+def _hist_title(messages: list[dict]) -> str:
+    """First meaningful user message, else the first message of any kind."""
+    for pool in (
+        [m for m in messages if _hist_is_user_row(m)],
+        messages,
+    ):
+        for m in pool:
+            text = " ".join(str(m.get("message_content") or "").split())
+            if text:
+                return text
+    return "(empty conversation)"
+
+
+def group_history(rows: Any, *, now: datetime | None = None) -> list[dict]:
+    """Group raw `chat_messages` rows into conversations, most recent first.
+
+    Input rows are plain dicts with conversation_id / sender_id / sender_name /
+    message_content / sent_at.  Output is a list of dicts:
+
+        conversation_id, messages (chronological), title, count,
+        started_at, last_at, bucket ("TODAY" | "YESTERDAY" | "OLDER")
+    """
+    order: list[str] = []
+    by_id: dict[str, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("conversation_id") or "").strip() or "(unknown)"
+        conv = by_id.get(cid)
+        if conv is None:
+            conv = {"conversation_id": cid, "messages": []}
+            by_id[cid] = conv
+            order.append(cid)
+        conv["messages"].append(row)
+
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    conversations = []
+    for cid in order:
+        conv = by_id[cid]
+        messages = sorted(
+            conv["messages"],
+            key=lambda m: _hist_parse_stamp(m.get("sent_at")) or epoch,
+        )
+        stamps = [s for s in (_hist_parse_stamp(m.get("sent_at")) for m in messages) if s]
+        conversations.append({
+            "conversation_id": cid,
+            "messages":      messages,
+            "title":         _hist_title(messages),
+            "count":         len(messages),
+            "started_at":    min(stamps) if stamps else None,
+            "last_at":       max(stamps) if stamps else None,
+        })
+    conversations.sort(key=lambda c: c["last_at"] or epoch, reverse=True)
+    for conv in conversations:
+        conv["bucket"] = _hist_bucket(conv["last_at"], now=now)
+    return conversations
+
+
+_BUCKET_LABELS = {"TODAY": "Today", "YESTERDAY": "Yesterday", "OLDER": "Older"}
+
+
 class HistoryWidget(QWidget):
-    """Lazy-loading, expandable Neon chat history for the activity log."""
+    """ChatGPT-style conversation history backed by Neon `chat_messages`.
+
+    Threading contract (this is the part that was broken):
+    the Neon fetch runs in a plain `threading.Thread`, and its result is handed
+    back to the GUI thread through `pyqtSignal`, which Qt delivers as a queued
+    connection because the receiver lives in the main thread.
+
+    Do NOT replace that with `QTimer.singleShot(0, ...)` from the worker.  Qt
+    creates the timer in the *calling* thread, that thread has no event
+    dispatcher, so the callback silently never runs: `_loaded_rows()` is never
+    called, `_busy` is never cleared, and the tab stays on "Loading chat
+    history…" forever (and every later `reload()` returns early because `_busy`
+    is still True).
+    """
+
+    # (generation, payload) pairs: the generation lets a late worker be
+    # ignored after a timeout or a second HISTORY click.
+    _rows_ready = pyqtSignal(object)     # (generation, list[dict] of rows)
+    _fetch_error = pyqtSignal(object)    # (generation, formatted error text)
+
+    FETCH_LIMIT = 400                    # recent rows pulled from Neon
+    TIMEOUT_MS = 20_000                  # loading state is never held longer
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._loaded = False
         self._busy = False
+        self._loaded = False
+        self._generation = 0             # discards results of superseded loads
+        self._conversations: list[dict] = []
+        self._open: dict | None = None
+
+        # Receiver side of the worker -> GUI hand-off. Connected here, in the
+        # GUI thread, so the emission from the worker is queued.
+        self._rows_ready.connect(self._loaded_rows)
+        self._fetch_error.connect(self._show_error)
+
+        self._guard = QTimer(self)
+        self._guard.setSingleShot(True)
+        self._guard.timeout.connect(self._on_timeout)
+
         self._rows = QVBoxLayout()
         self._rows.setContentsMargins(4, 4, 4, 4)
         self._rows.setSpacing(5)
@@ -1099,22 +1270,130 @@ class HistoryWidget(QWidget):
         outer.addWidget(self._scroll)
         self._show_status("Select HISTORY to load saved messages.")
 
+    # ── loading lifecycle ───────────────────────────────────────────────────
     def reload(self):
         if self._busy:
+            _hist_log("Load requested — already fetching, ignored")
             return
         self._busy = True
+        self._generation += 1
+        self._open = None
         self._clear()
         self._show_status("Loading chat history…")
-        threading.Thread(target=self._fetch, daemon=True).start()
+        self._guard.start(self.TIMEOUT_MS)
+        _hist_log("Load requested")
+        threading.Thread(
+            target=self._fetch_worker, daemon=True, name="hist-fetch"
+        ).start()
 
-    def _fetch(self):
+    def _fetch_worker(self):
+        """Runs in a worker thread: touch no widgets here, only emit.
+
+        Every exit path emits exactly one signal, so the GUI thread is always
+        told *something* and "Loading chat history…" can never outlive this
+        call.  Row coercion sits inside the try on purpose: an unexpected
+        return type used to raise inside the thread, where nothing catches it,
+        and the tab then sat on the loading label until the timeout fired.
+        """
+        generation = self._generation
+        _hist_log("Fetch started")
         try:
             from core.chat_history import fetch_history
-            rows = fetch_history()
-            QTimer.singleShot(0, lambda: self._loaded_rows(rows))
+            rows = fetch_history(self.FETCH_LIMIT)
+            if isinstance(rows, list):
+                normalized = rows
+            elif rows is None:
+                normalized = []
+            else:
+                normalized = list(rows)
+            _hist_log(f"Fetch returned {len(normalized)} rows")
         except Exception as exc:
-            QTimer.singleShot(0, lambda: self._load_failed(str(exc)))
+            # Never swallowed silently: real traceback to stderr, real text to UI.
+            import traceback
+            _hist_log(f"Fetch FAILED {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            if generation != self._generation:
+                _hist_log("Discarding failure of a superseded fetch")
+                return
+            self._fetch_error.emit((generation, f"{type(exc).__name__}: {exc}"))
+            return
+        if generation != self._generation:
+            _hist_log("Discarding result of a superseded fetch")
+            return
+        self._rows_ready.emit((generation, normalized))
 
+    def _on_timeout(self):
+        """Hard guarantee that 'Loading chat history…' is always cleared."""
+        if not self._busy:
+            return
+        _hist_log(f"Fetch timed out after {self.TIMEOUT_MS // 1000}s")
+        self._generation += 1            # ignore whatever the worker emits later
+        self._busy = False
+        self._clear()
+        self._show_status(
+            "Unable to load chat history\n"
+            f"Neon did not respond within {self.TIMEOUT_MS // 1000}s."
+        )
+
+    def _is_stale(self, generation: int) -> bool:
+        """True when a result belongs to a load the user already abandoned
+        (the timeout fired, or HISTORY was clicked again)."""
+        if generation != self._generation or not self._busy:
+            _hist_log(f"Ignoring stale result (result gen {generation}, "
+                      f"current gen {self._generation}, busy={self._busy})")
+            return True
+        return False
+
+    def _loaded_rows(self, payload):
+        generation, rows = payload
+        if self._is_stale(generation):
+            return
+        self._guard.stop()
+        self._busy = False
+        self._loaded = True
+        self._clear()
+        conversations = group_history(rows)
+        self._conversations = conversations
+        _hist_log(f"Converted {len(rows or [])} rows into {len(conversations)} conversations")
+        _hist_log("UI update started")
+        if not conversations:
+            # Only a *successful* empty fetch may say "no history".
+            self._show_status("No chat history yet")
+        else:
+            self._render_list()
+        _hist_log("UI update completed")
+
+    def _show_error(self, payload):
+        """Neon unreachable: report it, and offer SQLite rows if there are any."""
+        generation, error = payload
+        if self._is_stale(generation):
+            return
+        self._guard.stop()
+        self._busy = False
+        self._generation += 1
+        self._clear()
+        _hist_log(f"UI update started (error state): {error}")
+        local = self._local_rows()
+        if local:
+            self._conversations = group_history(local)
+            self._banner(f"Unable to load chat history\n{error}\n\nUsing local history…")
+            self._render_list()
+        else:
+            self._show_status(f"Unable to load chat history\n{error}")
+        _hist_log("UI update completed (error state)")
+
+    @staticmethod
+    def _local_rows() -> list[dict]:
+        try:
+            from core.chat_history import _fetch_sqlite
+            rows = _fetch_sqlite(200)
+            _hist_log(f"Local SQLite fallback has {len(rows)} rows")
+            return rows
+        except Exception as exc:
+            _hist_log(f"Local SQLite fallback unavailable: {exc}")
+            return []
+
+    # ── rendering ───────────────────────────────────────────────────────────
     def _clear(self):
         while self._rows.count():
             item = self._rows.takeAt(0)
@@ -1129,61 +1408,111 @@ class HistoryWidget(QWidget):
         self._rows.addWidget(label)
         self._rows.addStretch()
 
-    def _loaded_rows(self, rows: list[dict]):
-        self._busy = False
-        self._loaded = True
-        self._clear()
-        if not rows:
-            self._show_status(
-                "No saved messages yet. Configure Neon and start a conversation."
-            )
-            return
-        for row in rows:
-            self._add_row(row)
-        self._rows.addStretch()
+    def _banner(self, text: str):
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            f"color: {C.ACC2}; background: {C.PANEL2}; border: 1px solid {C.BORDER};"
+            f" border-radius: 3px; padding: 7px;"
+        )
+        self._rows.addWidget(label)
 
-    def _load_failed(self, error: str):
-        self._busy = False
-        self._clear()
-        self._show_status(f"History unavailable: {error}")
+    def _add_bucket_header(self, text: str):
+        label = QLabel(text)
+        label.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        label.setStyleSheet(
+            f"color: {C.PRI}; background: transparent; padding: 6px 2px 2px 2px;"
+        )
+        self._rows.addWidget(label)
 
-    def _add_row(self, row: dict):
-        sender = str(row.get("sender_name") or row.get("sender_id") or "Unknown")
-        content = str(row.get("message_content") or "")
-        stamp = str(row.get("sent_at") or "")
-        try:
-            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            date_text = parsed.astimezone().strftime("%Y-%m-%d")
-            time_text = parsed.astimezone().strftime("%H:%M")
-        except ValueError:
-            date_text, time_text = stamp[:10] or "Unknown date", stamp[11:16]
-        snippet = " ".join(content.split())
-        if len(snippet) > 58:
-            snippet = snippet[:55] + "…"
-
-        header = QPushButton(f"{sender}  •  {snippet}\n{date_text}  {time_text}")
-        header.setCursor(Qt.CursorShape.PointingHandCursor)
-        header.setStyleSheet(f"""
+    def _add_conversation_button(self, conv: dict):
+        title = " ".join(str(conv["title"]).split())
+        if len(title) > 58:
+            title = title[:55] + "…"
+        stamp = conv["last_at"]
+        if stamp is not None:
+            local = stamp.astimezone()
+            when = (local.strftime("%H:%M") if conv["bucket"] == "TODAY"
+                    else local.strftime("%Y-%m-%d %H:%M"))
+        else:
+            when = "unknown time"
+        btn = QPushButton(f"{title}\n{when}  •  {conv['count']} message"
+                          f"{'s' if conv['count'] != 1 else ''}")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(f"""
             QPushButton {{
                 text-align: left; color: {C.TEXT}; background: {C.PANEL2};
                 border: 1px solid {C.BORDER}; border-radius: 3px; padding: 6px;
             }}
             QPushButton:hover {{ border-color: {C.PRI_DIM}; color: {C.PRI}; }}
         """)
-        detail = QLabel(content)
-        detail.setWordWrap(True)
-        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        detail.setStyleSheet(
+        btn.clicked.connect(lambda checked=False, c=conv: self._open_conversation(c))
+        self._rows.addWidget(btn)
+
+    def _render_list(self):
+        current = None
+        for conv in self._conversations:
+            bucket = conv["bucket"]
+            if bucket != current:
+                current = bucket
+                self._add_bucket_header(_BUCKET_LABELS.get(bucket, bucket.title()))
+            self._add_conversation_button(conv)
+        self._rows.addStretch()
+
+    def _open_conversation(self, conv: dict):
+        self._open = conv
+        self._clear()
+        self._render_messages(conv)
+        self._rows.addStretch()
+        self._scroll.verticalScrollBar().setValue(0)
+        _hist_log(f"Opened conversation with {conv['count']} messages")
+
+    def _back_to_list(self):
+        self._open = None
+        self._clear()
+        self._render_list()
+        self._scroll.verticalScrollBar().setValue(0)
+        _hist_log("Returned to conversation list")
+
+    def _render_messages(self, conv: dict):
+        back = QPushButton("‹  Back to conversations")
+        back.setCursor(Qt.CursorShape.PointingHandCursor)
+        back.setStyleSheet(f"""
+            QPushButton {{
+                text-align: left; color: {C.TEXT_MED}; background: transparent;
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 5px;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
+        """)
+        back.clicked.connect(self._back_to_list)
+        self._rows.addWidget(back)
+
+        for row in conv["messages"]:
+            self._add_message_block(row)
+
+    def _add_message_block(self, row: dict):
+        sender = str(row.get("sender_name") or row.get("sender_id") or "Unknown")
+        content = str(row.get("message_content") or "")
+        stamp = _hist_parse_stamp(row.get("sent_at"))
+        if stamp is not None:
+            when = stamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            when = str(row.get("sent_at") or "")
+        is_user = _hist_is_user_row(row)
+        name_col = C.WHITE if is_user else C.PRI
+
+        head = QLabel(f"{sender}   ·   {when}")
+        head.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        head.setStyleSheet(f"color: {name_col}; background: transparent;")
+        body = QLabel(content)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body.setStyleSheet(
             f"color: {C.TEXT_MED}; background: {C.PANEL}; "
             f"border: 1px solid {C.BORDER}; padding: 7px;"
         )
-        detail.setVisible(False)
-        header.clicked.connect(
-            lambda checked=False, panel=detail:
-            panel.setVisible(not panel.isVisible())
-        )
-        self._rows.addWidget(header)
-        self._rows.addWidget(detail)
+        self._rows.addWidget(head)
+        self._rows.addWidget(body)
 
 _FILE_ICONS = {
     "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),
